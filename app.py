@@ -52,6 +52,12 @@ def load_xgb_model():
         if hasattr(model, 'gpu_id'):
             del model.gpu_id
 
+        # Pastikan tree_method adalah 'hist' atau CPU
+        if hasattr(model, 'get_params'):
+            params = model.get_params()
+            if 'tree_method' not in params or params['tree_method'] != 'hist':
+                model.set_params(tree_method='hist')
+        
         print("✓ Model loaded from PKL successfully.")
         print(f"Model n_features_in_: {model.n_features_in_}")
         print(f"Booster num features: {model.get_booster().num_features()}")
