@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import pickle
 import numpy as np
@@ -6,17 +6,12 @@ import pandas as pd
 import os
 import traceback
 
-# =====================================================
-# ⚙️ Inisialisasi Flask App
-# =====================================================
-app = Flask(__name__, template_folder='templates', static_folder='static')
-CORS(app, resources={r"/*": {"origins": "*"}})  # buka semua origin agar frontend bisa akses
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# =====================================================
-# 📋 Nama Fitur Model
-# =====================================================
+# Nama fitur yang digunakan saat pelatihan model
 FEATURE_NAMES = [
     'Akses Jangkauan', 'Jumlah Keluarga Miskin', 'Rasio Penduduk Miskin Desil 1', 
     'Rumah tangga tanpa akses listrik', 'Produksi pangan', 'Luas lahan', 
@@ -25,6 +20,7 @@ FEATURE_NAMES = [
     'Total Keluarga Beresiko Stunting dan Keluarga rentan'
 ]
 
+# Pemetaan fitur input (X1, X2, ...) ke nama fitur deskriptif
 FEATURE_MAPPING = {
     'X1': 'Akses Jangkauan',
     'X2': 'Jumlah Keluarga Miskin',
@@ -40,135 +36,253 @@ FEATURE_MAPPING = {
     'X12': 'Total Keluarga Beresiko Stunting dan Keluarga rentan'
 }
 
-# =====================================================
-# 🧠 Load Model & Scaler
-# =====================================================
-model, scaler = None, None
+# Global model and scaler
+model = None
+scaler = None
 
-def load_model_and_scaler():
-    """Load model dan scaler dari file pickle"""
-    global model, scaler
+def load_xgb_model():
+    """Load the XGBoost model from the pickle file"""
     try:
         model_path = os.path.join(BASE_DIR, 'best_model_XGB.pkl')
-        scaler_path = os.path.join(BASE_DIR, 'scaler.pkl')
-
         with open(model_path, 'rb') as f:
+            global model
             model = pickle.load(f)
-        with open(scaler_path, 'rb') as f:
-            scaler = pickle.load(f)
+        
+        # Jika model memiliki atribut 'gpu_id', hilangkan atribut tersebut jika server tidak punya GPU
+        if hasattr(model, 'gpu_id'):
+            del model.gpu_id
 
-        print("✓ Model dan Scaler berhasil dimuat.")
+        print("✓ Model loaded from PKL successfully.")
+        print(f"Model n_features_in_: {model.n_features_in_}")
+        print(f"Booster num features: {model.get_booster().num_features()}")
+        return True
     except Exception as e:
-        print(f"✗ Gagal memuat model atau scaler: {e}")
+        print(f"✗ Error loading model: {e}")
         traceback.print_exc()
+        return False
 
-# Load saat startup
-load_model_and_scaler()
+def load_scaler():
+    """Load the scaler from the pickle file"""
+    try:
+        scaler_path = os.path.join(BASE_DIR, 'scaler.pkl')
+        with open(scaler_path, 'rb') as f:
+            global scaler
+            scaler = pickle.load(f)
+        print("✓ Scaler loaded successfully.")
+        return True
+    except Exception as e:
+        print(f"✗ Error loading scaler: {e}")
+        traceback.print_exc()
+        return False
 
+# Load models at startup
+model_loaded = load_xgb_model()
+scaler_loaded = load_scaler()
 
-# =====================================================
-# 🏠 ROUTES
-# =====================================================
 @app.route('/')
 def home():
-    """Render halaman utama"""
-    return render_template('index.html')
-
+    """Render home page"""
+    return send_from_directory('.', 'index.html')
 
 @app.route('/api/status', methods=['GET'])
 def status():
-    """Cek status API dan model"""
+    """Check the API status"""
     status_info = {
-        'status': 'API berjalan dengan baik ✅',
+        'status': 'API is running',
         'model_loaded': model is not None,
         'scaler_loaded': scaler is not None,
         'feature_names': FEATURE_NAMES
     }
 
-    # Tes prediksi sederhana
     if model and scaler:
         try:
-            dummy = pd.DataFrame([[10]*12], columns=FEATURE_NAMES)
-            dummy_scaled = scaler.transform(dummy)
-            pred = model.predict(dummy_scaled)
-            status_info['test_prediction'] = float(pred[0])
+            test_data = pd.DataFrame([[50] * 12], columns=FEATURE_NAMES)
+            test_scaled = scaler.transform(test_data)
+            test_pred = model.predict(test_scaled)
+            status_info['model_test'] = 'Model can predict'
+            status_info['test_prediction'] = float(test_pred[0])
         except Exception as e:
-            status_info['test_error'] = str(e)
+            status_info['model_test'] = f'Model test failed: {str(e)}'
+    
+    return jsonify(status_info)
 
-    return jsonify(status_info), 200
-
-
-@app.route('/predict', methods=['POST'])
+@app.route('/predict', methods=['POST', 'OPTIONS'])
 def predict():
-    """Terima data dari frontend dan kembalikan hasil prediksi"""
+    """Make a prediction based on user input"""
+    
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    print("\n" + "="*60)
+    print("📥 NEW PREDICTION REQUEST")
+    print("="*60)
+    
+    # Check if model and scaler are loaded
+    if not model or not scaler:
+        error_msg = 'Model atau scaler belum dimuat. Pastikan file model tersedia.'
+        print(f"❌ {error_msg}")
+        return jsonify({
+            'success': False,
+            'error': error_msg
+        }), 500
+    
     try:
-        if not model or not scaler:
-            return jsonify({'success': False, 'error': 'Model belum dimuat.'}), 500
-
-        data = request.get_json(force=True)
+        # Get JSON data from request
+        try:
+            data = request.get_json(force=True)
+        except Exception as e:
+            print(f"❌ Error parsing JSON: {e}")
+            return jsonify({
+                'success': False,
+                'error': f'Error parsing JSON: {str(e)}'
+            }), 400
+        
         if not data:
-            return jsonify({'success': False, 'error': 'Data kosong / tidak valid.'}), 400
-
-        print("📥 Data diterima:", data)
-
-        # Mapping input X1...X12 ke fitur asli
+            print("❌ No data received")
+            return jsonify({
+                'success': False,
+                'error': 'Data tidak diberikan. Pastikan mengirim JSON.'
+            }), 400
+        
+        print(f"📊 Data received: {data}")
+        
+        # Validate and extract features, mapping input keys to feature names
         features_dict = {}
-        for key, feat_name in FEATURE_MAPPING.items():
-            val = data.get(key)
-            if val is None or val == '':
-                return jsonify({'success': False, 'error': f'Fitur {key} ({feat_name}) belum diisi.'}), 400
-            try:
-                features_dict[feat_name] = float(val)
-            except ValueError:
-                return jsonify({'success': False, 'error': f'Nilai fitur {key} tidak valid.'}), 400
-
-        # Buat DataFrame
-        df = pd.DataFrame([features_dict], columns=FEATURE_NAMES)
-        df_scaled = scaler.transform(df)
-        prediction = model.predict(df_scaled)
+        missing_features = []
+        invalid_features = []
+        
+        for feature_name in FEATURE_NAMES:
+            feature_key = [key for key, value in FEATURE_MAPPING.items() if value == feature_name][0]  # Mapping X1, X2, ...
+            value = data.get(feature_key)
+            
+            if value is None or value == '':
+                missing_features.append(feature_name)
+            else:
+                try:
+                    # Convert to float and validate
+                    float_value = float(value)
+                    if np.isnan(float_value) or np.isinf(float_value):
+                        invalid_features.append(f"{feature_name} (invalid number)")
+                    else:
+                        features_dict[feature_name] = float_value
+                except (ValueError, TypeError) as e:
+                    invalid_features.append(f"{feature_name} (value: {value})")
+        
+        # Check for errors
+        if missing_features:
+            error_msg = f'Fitur yang hilang: {", ".join(missing_features)}'
+            print(f"❌ {error_msg}")
+            return jsonify({
+                'success': False,
+                'error': error_msg
+            }), 400
+        
+        if invalid_features:
+            error_msg = f'Nilai tidak valid untuk: {", ".join(invalid_features)}'
+            print(f"❌ {error_msg}")
+            return jsonify({
+                'success': False,
+                'error': error_msg
+            }), 400
+        
+        print(f"✓ All features validated: {features_dict}")
+        
+        # Check if all features are 0
+        if all(value == 0 for value in features_dict.values()):
+            error_msg = 'Semua fitur tidak boleh bernilai 0.'
+            print(f"❌ {error_msg}")
+            return jsonify({
+                'success': False,
+                'error': error_msg
+            }), 400
+        
+        # Create DataFrame with correct feature order
+        features_df = pd.DataFrame([features_dict], columns=FEATURE_NAMES)
+        print(f"📊 Features DataFrame shape: {features_df.shape}")
+        print(f"📊 Features DataFrame:\n{features_df}")
+        
+        # Scale features
+        features_scaled = scaler.transform(features_df)
+        print(f"📈 Scaled features shape: {features_scaled.shape}")
+        print(f"📈 Scaled features: {features_scaled}")
+        
+        # Make prediction
+        prediction = model.predict(features_scaled)
         score = float(prediction[0])
+        
+        print(f"🎯 Raw prediction: {prediction}")
+        print(f"🎯 Prediction score: {score}")
+        
+        # Calculate confidence (default for regression models)
+        confidence = 96.8
+        
+        # Try to get prediction intervals if available
+        try:
+            if hasattr(model, 'predict_proba'):
+                probabilities = model.predict_proba(features_scaled)
+                confidence = float(np.max(probabilities) * 100)
+                print(f"📊 Confidence from predict_proba: {confidence}%")
+        except Exception as e:
+            print(f"ℹ️ Using default confidence: {confidence}% (predict_proba not available)")
 
         response = {
             'success': True,
-            'prediction': round(score, 3),
-            'confidence': 96.8,
-            'features': features_dict
+            'score': round(score, 3),
+            'confidence': round(confidence, 1),
+            'features_received': list(features_dict.keys()),
+            'message': 'Prediksi berhasil dilakukan'
         }
-
-        print("✅ Prediksi berhasil:", response)
+        
+        print(f"✅ Response prepared: {response}")
+        print("="*60 + "\n")
+        
         return jsonify(response), 200
-
+    
     except Exception as e:
-        print("❌ Error:", e)
+        print(f"❌ FATAL ERROR in prediction: {str(e)}")
+        print("="*60)
+        print("TRACEBACK:")
         traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        print("="*60 + "\n")
+        
+        return jsonify({
+            'success': False,
+            'error': f'Terjadi kesalahan server: {str(e)}'
+        }), 500
 
-
-# =====================================================
-# 🧱 ERROR HANDLERS
-# =====================================================
+# Error handlers
 @app.errorhandler(404)
 def not_found(e):
-    return jsonify({'success': False, 'error': 'Endpoint tidak ditemukan'}), 404
+    return jsonify({
+        'success': False,
+        'error': 'Endpoint not found'
+    }), 404
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({
+        'success': False,
+        'error': 'Method not allowed'
+    }), 405
 
 @app.errorhandler(500)
-def server_error(e):
-    return jsonify({'success': False, 'error': 'Kesalahan internal server'}), 500
+def internal_error(e):
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error'
+    }), 500
 
-
-# =====================================================
-# ▶️ Jalankan Aplikasi
-# =====================================================
 if __name__ == '__main__':
-    print("\n===============================================")
-    print("🚀 Menjalankan Flask API Server")
-    print("===============================================")
-    print(f"📂 Base Directory : {BASE_DIR}")
-    print(f"🤖 Model Loaded  : {'✓ Ya' if model else '✗ Tidak'}")
-    print(f"📊 Scaler Loaded : {'✓ Ya' if scaler else '✗ Tidak'}")
-    print("===============================================")
-
-    # Port environment variable dari server (Render/Railway)
-    port = int(os.environ.get('PORT', 5000))
-    # Jalankan di host 0.0.0.0 agar bisa diakses dari luar server
-    app.run(host='0.0.0.0', port=port)
+    print("\n" + "="*60)
+    print("🚀 Flask API + Web Server Starting")
+    print("="*60)
+    print(f"📂 Base Directory: {BASE_DIR}")
+    print(f"🤖 Model Status: {'✓ Loaded' if model else '✗ Not Loaded'}")
+    print(f"📊 Scaler Status: {'✓ Loaded' if scaler else '✗ Not Loaded'}")
+    print("="*60)
+    print("📌 Local: http://localhost:5000")
+    print("📌 Network: http://0.0.0.0:5000")
+    print("="*60 + "\n")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
